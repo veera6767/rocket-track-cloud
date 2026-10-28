@@ -1,7 +1,15 @@
 import { create } from 'zustand';
 import { Sample, InterpolatedSample, SessionRecord, WsServerMessage, SessionStats } from '../../shared/types.js';
-import { interpolateGpsSamples, haversineDistance } from '../../shared/math.js';
+import {
+  interpolateGpsSamples,
+  haversineDistance,
+  calculateStartGpsAltitude,
+  inferSeqStep,
+  deriveSessionStats,
+} from '../../shared/math.js';
 import { audioManager } from '../utils/audio.js';
+
+export { deriveSessionStats };
 
 export type VehicleType = 'ground' | 'rocket';
 export type TrailStyle = 'ribbon' | 'tube' | 'comet' | 'particles' | 'curtain' | 'extrusion';
@@ -11,7 +19,7 @@ export type CameraPreset = 'follow' | 'overview' | 'top' | 'side' | 'free';
 export type QualityTier = 'high' | 'medium' | 'low';
 export type OrientationMode = 'attitude' | 'velocity' | 'upright';
 export type PhoneMounting = 'nose' | 'flat' | 'landscape';
-export type TileSource = 'carto' | 'osm_dark' | 'canvas';
+export type TileSource = 'osm_dark' | 'satellite' | 'canvas';
 export type TimeWindow = '30s' | '2m' | '10m' | 'all';
 
 export interface HudToastItem {
@@ -55,6 +63,10 @@ interface TelemetryState {
   ratePerSec: number;
   lastSampleAt: number | null;
   linkLatencyMs: number | null;
+  lastBatchReceivedAt: number;
+  seqStep: number;
+  startGpsAlt: number | null;
+  isDiagnosticsOpen: boolean;
   isAccessModalOpen: boolean;
   isDeviceLinkOpen: boolean;
 
@@ -153,6 +165,8 @@ interface TelemetryState {
 
   // Device Link & Orientation Actions
   setDeviceLinkOpen: (open: boolean) => void;
+  setDiagnosticsOpen: (open: boolean) => void;
+  setSeqStep: (step: number) => void;
   setOrientationMode: (mode: OrientationMode) => void;
   setPhoneMounting: (m: PhoneMounting) => void;
   rotateManual: (axis: 'pitch' | 'roll' | 'yaw', deltaDeg: number) => void;
@@ -215,6 +229,10 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
     ratePerSec: 0,
     lastSampleAt: null,
     linkLatencyMs: null,
+    lastBatchReceivedAt: 0,
+    seqStep: 1,
+    startGpsAlt: null,
+    isDiagnosticsOpen: false,
     isAccessModalOpen: false,
     isDeviceLinkOpen: false,
     waitingForPhone: true,
@@ -222,7 +240,7 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
     clockOffsetMs: 0,
     serverRttMs: 0,
     lastToast: null,
-    tileSource: 'carto',
+    tileSource: 'osm_dark',
 
     vehicleType: savedVehicle,
     orientationMode: 'velocity',
@@ -378,6 +396,8 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
     },
 
     setDeviceLinkOpen: (open: boolean) => set({ isDeviceLinkOpen: open }),
+    setDiagnosticsOpen: (open: boolean) => set({ isDiagnosticsOpen: open }),
+    setSeqStep: (step: number) => set({ seqStep: step }),
     setOrientationMode: (mode: OrientationMode) => set({ orientationMode: mode }),
     setPhoneMounting: (m: PhoneMounting) => set({ phoneMounting: m }),
     rotateManual: (axis, deltaDeg) => {
@@ -619,6 +639,7 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
                   currentSessionId: msg.sessionId,
                   activeDeviceId: msg.deviceId || found?.deviceId || state.activeDeviceId,
                   waitingForPhone: !isPhone && state.waitingForPhone,
+                  seqStep: msg.seqStep || state.seqStep || 1,
                   currentSession: found || {
                     id: msg.sessionId,
                     name: `Sounding Session ${msg.sessionId.substring(0, 12)}`,
@@ -628,6 +649,7 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
                     endedAt: null,
                     sampleCount: 0,
                     bounds: null,
+                    seqStep: msg.seqStep || 1,
                   },
                 });
               }
@@ -645,6 +667,7 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
                     type: 'phone',
                   },
                   activeDeviceId: msg.session.deviceId,
+                  seqStep: msg.session.seqStep || state.seqStep || 1,
                 });
                 audioManager.playConnect();
                 get().selectSession(msg.session.id);
@@ -658,6 +681,7 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
                     type: 'sim',
                   },
                   activeDeviceId: msg.session.deviceId,
+                  seqStep: msg.session.seqStep || state.seqStep || 1,
                 });
                 get().fetchSessions();
               }
@@ -667,6 +691,7 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
                 deviceOnline: msg.deviceOnline,
                 lastSampleAt: msg.lastSampleAt,
                 ratePerSec: msg.ratePerSec,
+                seqStep: msg.seqStep || state.seqStep || 1,
                 ...(msg.deviceId ? { activeDeviceId: msg.deviceId } : {}),
               });
               if (prevOnline && !msg.deviceOnline) {
@@ -691,12 +716,13 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
                 }
               }
 
+              const startAlt = calculateStartGpsAltitude(merged);
               let origin = state.originGps;
-              if (!origin) {
+              if (!origin || (startAlt !== null && origin.alt !== startAlt)) {
                 for (const s of merged) {
                   if (s.lat !== null && s.lon !== null && s.gps_alt !== null) {
-                    origin = { lat: s.lat, lon: s.lon, alt: s.gps_alt };
-                    audioManager.playGpsFix();
+                    origin = { lat: s.lat, lon: s.lon, alt: startAlt ?? s.gps_alt };
+                    if (!state.originGps) audioManager.playGpsFix();
                     break;
                   }
                 }
@@ -704,9 +730,9 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
 
               const interpolated = interpolateGpsSamples(merged);
               const latestSample = merged[merged.length - 1];
+              const step = msg.seqStep || inferSeqStep(merged) || state.seqStep || 1;
 
               // Latency: compute phone-to-server clock offset with RTT removed
-              // show "n/a" (null) instead of absurd values (> 30s or < 0)
               const estimatedClientNow = Date.now() - state.clockOffsetMs;
               const rawDelayMs = estimatedClientNow - latestSample.t;
               const cleanLatency = rawDelayMs >= 0 && rawDelayMs <= 30000 ? Math.round(rawDelayMs) : null;
@@ -715,7 +741,10 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
                 samples: merged,
                 interpolatedSamples: interpolated,
                 originGps: origin,
+                startGpsAlt: startAlt,
+                seqStep: step,
                 lastSeenSeq: latestSample.seq,
+                lastBatchReceivedAt: Date.now(),
                 linkLatencyMs: cleanLatency,
                 waitingForPhone: false,
                 replayIndex: state.isReplayMode ? state.replayIndex : merged.length - 1,
@@ -753,55 +782,3 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => {
     },
   };
 });
-
-/**
- * Derives comprehensive session statistics
- */
-export function deriveSessionStats(samples: InterpolatedSample[]): SessionStats {
-  if (samples.length === 0) {
-    return {
-      durationSeconds: 0,
-      distanceMeters: 0,
-      maxSpeedKmh: 0,
-      maxAccelG: 0,
-      maxAltitudeMeters: 0,
-      sampleCount: 0,
-      avgRateHz: 0,
-      packetsLost: 0,
-    };
-  }
-
-  const firstT = samples[0].t;
-  const lastT = samples[samples.length - 1].t;
-  const durationSeconds = Math.max(0.1, (lastT - firstT) / 1000);
-
-  let maxSpeedMps = 0;
-  let maxAccelMs2 = 0;
-  let maxAlt = -Infinity;
-  let minSeq = samples[0].seq;
-  let maxSeq = samples[samples.length - 1].seq;
-
-  for (const s of samples) {
-    if (s.speed !== null && s.speed > maxSpeedMps) maxSpeedMps = s.speed;
-    if (s.accelMag && s.accelMag > maxAccelMs2) maxAccelMs2 = s.accelMag;
-    if (s.gps_alt !== null && s.gps_alt > maxAlt) maxAlt = s.gps_alt;
-    if (s.seq < minSeq) minSeq = s.seq;
-    if (s.seq > maxSeq) maxSeq = s.seq;
-  }
-
-  const expectedPackets = maxSeq - minSeq + 1;
-  const packetsLost = Math.max(0, expectedPackets - samples.length);
-  const lastSample = samples[samples.length - 1];
-  const distanceMeters = lastSample.distanceMeters || 0;
-
-  return {
-    durationSeconds,
-    distanceMeters,
-    maxSpeedKmh: maxSpeedMps * 3.6,
-    maxAccelG: maxAccelMs2 / 9.80665,
-    maxAltitudeMeters: maxAlt === -Infinity ? 0 : maxAlt,
-    sampleCount: samples.length,
-    avgRateHz: Math.round(samples.length / durationSeconds),
-    packetsLost,
-  };
-}

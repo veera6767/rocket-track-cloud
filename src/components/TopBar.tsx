@@ -17,6 +17,7 @@ import {
   Share2,
   Maximize,
   Minimize,
+  Activity,
 } from 'lucide-react';
 
 export const TopBar: React.FC = () => {
@@ -31,12 +32,15 @@ export const TopBar: React.FC = () => {
     activeDeviceId,
     ratePerSec,
     lastSampleAt,
+    lastBatchReceivedAt,
+    seqStep,
     linkLatencyMs,
     interpolatedSamples,
     isSoundMuted,
     setSoundMuted,
     setAccessModalOpen,
     setDeviceLinkOpen,
+    setDiagnosticsOpen,
     vehicleType,
     setVehicleType,
     role,
@@ -45,14 +49,17 @@ export const TopBar: React.FC = () => {
   } = useTelemetryStore();
 
   const [signalLostElapsedSec, setSignalLostElapsedSec] = useState<number>(0);
+  const [now, setNow] = useState(Date.now());
 
-  // Determine connection status: LIVE / WAITING / SIGNAL LOST
-  // LIVE: deviceOnline is true and samples exist
-  // WAITING: no samples received in session yet
-  // SIGNAL LOST: had samples, but now deviceOnline is false (> 5s since last sample)
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(timer);
+  }, []);
+
   const hasSamples = interpolatedSamples.length > 0;
-  const isLive = wsStatus === 'connected' && deviceOnline && hasSamples;
-  const isSignalLost = hasSamples && (!deviceOnline || (lastSampleAt && Date.now() - lastSampleAt >= 5000));
+  const isWaitingForData = wsStatus === 'connected' && (now - lastBatchReceivedAt > 3000 || lastBatchReceivedAt === 0);
+  const isSignalLost = hasSamples && (!deviceOnline || (lastSampleAt && now - lastSampleAt >= 5000));
+  const isLive = wsStatus === 'connected' && deviceOnline && hasSamples && !isWaitingForData;
   const isWaiting = !hasSamples;
 
   // Running counter for "Signal lost 00:12 ago"
@@ -149,7 +156,12 @@ export const TopBar: React.FC = () => {
       {/* Zone 2: Status Pill, T+ Clock, Metrics */}
       <div className="flex items-center gap-2 md:gap-3 flex-wrap">
         {/* Status Pill */}
-        {isLive ? (
+        {isWaitingForData && wsStatus === 'connected' ? (
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-bold text-[#FBBF24] border-[#FBBF24]/40 bg-[#FBBF24]/10">
+            <Radio className="w-3 h-3 text-[#FBBF24] animate-pulse" />
+            <span>CONNECTED, WAITING FOR DATA</span>
+          </div>
+        ) : isLive ? (
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[11px] font-bold text-[#34D399] border-[#34D399]/40 bg-[#34D399]/10">
             <Radio className="w-3 h-3 text-[#34D399] animate-pulse" />
             <span>LIVE</span>
@@ -181,11 +193,11 @@ export const TopBar: React.FC = () => {
           {isSignalLost && <span className="text-[10px] text-[#8A97AD] font-normal uppercase">FROZEN</span>}
         </div>
 
-        {/* Rate (Hz) */}
+        {/* Rate (Hz) & Step */}
         <div className="hidden sm:flex items-center gap-1 bg-[#0B0F17] border border-[#243049] px-2 py-1 rounded-lg text-[#E6EAF2] tabular-nums">
           <span className="text-[#8A97AD]">RATE:</span>
-          <span className="text-[#34D399] font-bold">{ratePerSec}</span>
-          <span className="text-[#8A97AD] text-[10px]">Hz</span>
+          <span className="text-[#34D399] font-bold">{ratePerSec} Hz</span>
+          <span className="text-[#8A97AD] text-[10px]">(seq step {seqStep})</span>
         </div>
 
         {/* Link Latency */}
@@ -275,6 +287,16 @@ export const TopBar: React.FC = () => {
             ROCKET
           </button>
         </div>
+
+        {/* Diagnostics Button */}
+        <button
+          onClick={() => setDiagnosticsOpen(true)}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-[#172033] hover:bg-[#243049] border-[#243049] hover:border-[#38BDF8] text-xs font-mono font-medium text-[#E6EAF2] transition-colors cursor-pointer"
+          title="Open Telemetry Diagnostics Panel (Static Values & Raw JSON)"
+        >
+          <Activity className="w-3.5 h-3.5 text-[#38BDF8]" />
+          <span className="hidden sm:inline">DIAGNOSTICS</span>
+        </button>
 
         {/* Device Link Button (Admin only or when not strictly viewer) */}
         {role !== 'viewer' && (

@@ -121,31 +121,39 @@ export const TrailMap: React.FC = () => {
     if (container) container.classList.remove('tactical-grid-bg');
 
     let newTileLayer: L.TileLayer;
-    let errors = 0;
+    let consecutiveErrors = 0;
 
-    if (tileSource === 'osm_dark') {
+    if (tileSource === 'satellite') {
+      newTileLayer = L.tileLayer(
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        {
+          maxZoom: 19,
+          attribution:
+            'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+        }
+      );
+    } else {
+      // Default: OpenStreetMap darkened by CSS filter
       newTileLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom: 19,
         className: 'osm-dark-tiles',
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>',
       });
-    } else {
-      // Carto Dark (Free, fast, no API key watermark)
-      newTileLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-        maxZoom: 19,
-        subdomains: 'abcd',
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions" target="_blank">CARTO</a>',
-      });
     }
 
+    newTileLayer.on('tileload', () => {
+      consecutiveErrors = 0;
+    });
+
     newTileLayer.on('tileerror', () => {
-      errors++;
-      if (errors >= 4) {
-        console.warn('Map tiles failed to load, falling back to tactical grid.');
+      consecutiveErrors++;
+      if (consecutiveErrors >= 3) {
+        console.warn('Map tiles failed to load (3 consecutive errors), falling back to No tiles.');
         setTileSource('canvas');
         setToast({
           type: 'warning',
-          message: 'Tiles unavailable: fallback to tile-free grid',
+          title: 'MAP TILES UNAVAILABLE',
+          message: 'Tiles failed after 3 consecutive errors. Switched to No tiles mode.',
         });
       }
     });
@@ -285,10 +293,27 @@ export const TrailMap: React.FC = () => {
         }
       }
 
+      const isWeakGps =
+        (currentSample.gps_acc !== null && currentSample.gps_acc !== undefined && currentSample.gps_acc > 20) ||
+        (currentSample.gps_provider !== null && currentSample.gps_provider !== undefined && currentSample.gps_provider !== 'gps');
+
       const pos: L.LatLngTuple = [markerLat, markerLon];
       currentMarkerRef.current.setLatLng(pos);
       accuracyCircleRef.current.setLatLng(pos);
-      accuracyCircleRef.current.setRadius(currentSample.gps_acc || 4);
+      accuracyCircleRef.current.setRadius(currentSample.gps_acc || 5);
+      if (isWeakGps) {
+        accuracyCircleRef.current.setStyle({
+          color: '#FBBF24',
+          fillColor: '#FBBF24',
+          fillOpacity: 0.18,
+        });
+      } else {
+        accuracyCircleRef.current.setStyle({
+          color: '#38BDF8',
+          fillColor: '#38BDF8',
+          fillOpacity: 0.12,
+        });
+      }
 
       // Rotate heading arrow inside divIcon and update estimated status
       const arrowElem = document.getElementById('vehicle-arrow-elem');
@@ -337,9 +362,9 @@ export const TrailMap: React.FC = () => {
             className="bg-transparent text-[#8A97AD] font-mono text-xs focus:outline-none cursor-pointer"
             title="Map Tile Provider"
           >
-            <option value="carto" className="bg-[#111826] text-[#E6EAF2]">Carto Dark (Clean)</option>
-            <option value="osm_dark" className="bg-[#111826] text-[#E6EAF2]">OSM Dark</option>
-            <option value="canvas" className="bg-[#111826] text-[#E6EAF2]">Tactical Grid (Offline)</option>
+            <option value="osm_dark" className="bg-[#111826] text-[#E6EAF2]">OpenStreetMap (Dark)</option>
+            <option value="satellite" className="bg-[#111826] text-[#E6EAF2]">Satellite (Esri Imagery)</option>
+            <option value="canvas" className="bg-[#111826] text-[#E6EAF2]">No tiles (Canvas Grid)</option>
           </select>
         </div>
 

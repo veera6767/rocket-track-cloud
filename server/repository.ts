@@ -109,6 +109,8 @@ export class SqliteRepository implements ITelemetryRepository {
         sats_visible INTEGER,
         gps_cn0 REAL,
         gps_age_ms INTEGER,
+        gps_msl_alt REAL,
+        gps_provider TEXT,
         PRIMARY KEY (session_id, seq),
         FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
       );
@@ -119,9 +121,12 @@ export class SqliteRepository implements ITelemetryRepository {
 
     // Migrations for existing databases
     try { this.db.exec("ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'phone'"); } catch {}
+    try { this.db.exec("ALTER TABLE sessions ADD COLUMN seq_step INTEGER DEFAULT 1"); } catch {}
     try { this.db.exec("ALTER TABLE samples ADD COLUMN sats_visible INTEGER"); } catch {}
     try { this.db.exec("ALTER TABLE samples ADD COLUMN gps_cn0 REAL"); } catch {}
     try { this.db.exec("ALTER TABLE samples ADD COLUMN gps_age_ms INTEGER"); } catch {}
+    try { this.db.exec("ALTER TABLE samples ADD COLUMN gps_msl_alt REAL"); } catch {}
+    try { this.db.exec("ALTER TABLE samples ADD COLUMN gps_provider TEXT"); } catch {}
   }
 
   async createSession(id: string, name: string, deviceId: string, startedAt: number, source?: 'phone' | 'sim' | 'fc'): Promise<SessionRecord> {
@@ -200,14 +205,16 @@ export class SqliteRepository implements ITelemetryRepository {
         roll, pitch, yaw, pressure, altitude, prox,
         lat, lon, gps_alt, speed, sats, gps_acc,
         bearing, gps_fix_t, batt, batt_temp,
-        sats_visible, gps_cn0, gps_age_ms
+        sats_visible, gps_cn0, gps_age_ms,
+        gps_msl_alt, gps_provider
       ) VALUES (
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
-        ?, ?, ?
+        ?, ?, ?,
+        ?, ?
       )
     `);
 
@@ -225,7 +232,8 @@ export class SqliteRepository implements ITelemetryRepository {
           s.roll, s.pitch, s.yaw, s.pressure, s.altitude, s.prox,
           s.lat, s.lon, s.gps_alt, s.speed, s.sats, s.gps_acc,
           s.bearing, s.gps_fix_t, s.batt, s.batt_temp,
-          s.sats_visible ?? null, s.gps_cn0 ?? null, s.gps_age_ms ?? null
+          s.sats_visible ?? null, s.gps_cn0 ?? null, s.gps_age_ms ?? null,
+          s.gps_msl_alt ?? null, s.gps_provider ?? null
         );
         if (info.changes > 0) {
           accepted++;
@@ -383,7 +391,8 @@ export class SqliteRepository implements ITelemetryRepository {
       SELECT seq, t, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
              mag_x, mag_y, mag_z, roll, pitch, yaw, pressure, altitude, prox,
              lat, lon, gps_alt, speed, sats, gps_acc, bearing, gps_fix_t,
-             batt, batt_temp, sats_visible, gps_cn0, gps_age_ms
+             batt, batt_temp, sats_visible, gps_cn0, gps_age_ms,
+             gps_msl_alt, gps_provider
       FROM samples
       WHERE session_id = ?
     `;
@@ -413,7 +422,8 @@ export class SqliteRepository implements ITelemetryRepository {
       SELECT seq, t, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
              mag_x, mag_y, mag_z, roll, pitch, yaw, pressure, altitude, prox,
              lat, lon, gps_alt, speed, sats, gps_acc, bearing, gps_fix_t,
-             batt, batt_temp, sats_visible, gps_cn0, gps_age_ms
+             batt, batt_temp, sats_visible, gps_cn0, gps_age_ms,
+             gps_msl_alt, gps_provider
       FROM samples
       WHERE session_id = ?
       ORDER BY seq ASC
@@ -554,6 +564,8 @@ export class PostgresRepository implements ITelemetryRepository {
           sats_visible INTEGER,
           gps_cn0 REAL,
           gps_age_ms INTEGER,
+          gps_msl_alt REAL,
+          gps_provider TEXT,
           PRIMARY KEY (session_id, seq),
           CONSTRAINT fk_session FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
         );
@@ -563,9 +575,12 @@ export class PostgresRepository implements ITelemetryRepository {
       `);
 
       try { await client.query("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'phone'"); } catch {}
+      try { await client.query("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS seq_step INTEGER DEFAULT 1"); } catch {}
       try { await client.query("ALTER TABLE samples ADD COLUMN IF NOT EXISTS sats_visible INTEGER"); } catch {}
       try { await client.query("ALTER TABLE samples ADD COLUMN IF NOT EXISTS gps_cn0 REAL"); } catch {}
       try { await client.query("ALTER TABLE samples ADD COLUMN IF NOT EXISTS gps_age_ms INTEGER"); } catch {}
+      try { await client.query("ALTER TABLE samples ADD COLUMN IF NOT EXISTS gps_msl_alt REAL"); } catch {}
+      try { await client.query("ALTER TABLE samples ADD COLUMN IF NOT EXISTS gps_provider TEXT"); } catch {}
     } finally {
       client.release();
     }
@@ -823,7 +838,8 @@ export class PostgresRepository implements ITelemetryRepository {
       SELECT seq, t, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
              mag_x, mag_y, mag_z, roll, pitch, yaw, pressure, altitude, prox,
              lat, lon, gps_alt, speed, sats, gps_acc, bearing, gps_fix_t,
-             batt, batt_temp, sats_visible, gps_cn0, gps_age_ms
+             batt, batt_temp, sats_visible, gps_cn0, gps_age_ms,
+             gps_msl_alt, gps_provider
       FROM samples
       WHERE session_id = $1
     `;
@@ -853,7 +869,8 @@ export class PostgresRepository implements ITelemetryRepository {
       SELECT seq, t, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z,
              mag_x, mag_y, mag_z, roll, pitch, yaw, pressure, altitude, prox,
              lat, lon, gps_alt, speed, sats, gps_acc, bearing, gps_fix_t,
-             batt, batt_temp, sats_visible, gps_cn0, gps_age_ms
+             batt, batt_temp, sats_visible, gps_cn0, gps_age_ms,
+             gps_msl_alt, gps_provider
       FROM samples
       WHERE session_id = $1
       ORDER BY seq ASC
@@ -936,6 +953,8 @@ function mapPgSample(r: any): Sample {
     sats_visible: r.sats_visible !== null ? Number(r.sats_visible) : null,
     gps_cn0: r.gps_cn0 !== null ? Number(r.gps_cn0) : null,
     gps_age_ms: r.gps_age_ms !== null ? Number(r.gps_age_ms) : null,
+    gps_msl_alt: r.gps_msl_alt !== null && r.gps_msl_alt !== undefined ? Number(r.gps_msl_alt) : null,
+    gps_provider: r.gps_provider !== null && r.gps_provider !== undefined ? String(r.gps_provider) : null,
   };
 }
 

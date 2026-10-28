@@ -10,6 +10,7 @@ import { ReplayBar } from './components/ReplayBar.js';
 import { SessionStatsPanel } from './components/SessionStatsPanel.js';
 import { AccessKeyModal } from './components/AccessKeyModal.js';
 import { DeviceLinkModal } from './components/DeviceLinkModal.js';
+import { DiagnosticsDrawer } from './components/DiagnosticsDrawer.js';
 import { HudToast } from './components/HudToast.js';
 import { EmptyPhoneState } from './components/EmptyPhoneState.js';
 import {
@@ -63,6 +64,9 @@ export default function App() {
 
       {/* Device Link Modal */}
       <DeviceLinkModal />
+
+      {/* Diagnostics Drawer */}
+      <DiagnosticsDrawer />
 
       {/* Boot Splash */}
       {booting && (

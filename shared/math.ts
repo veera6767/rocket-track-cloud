@@ -1,4 +1,4 @@
-import { Sample, InterpolatedSample, Bounds } from './types.js';
+import { Sample, InterpolatedSample, Bounds, SessionStats } from './types.js';
 
 const EARTH_RADIUS_METERS = 6371000;
 
@@ -39,7 +39,7 @@ export function geodeticToEnu(
   const dLon = ((lon - originLon) * Math.PI) / 180;
   const meanLat = (((lat + originLat) / 2) * Math.PI) / 180;
 
-  // Local tangent plane approximation (highly accurate for regional ranges < 50 km)
+  // Local tangent plane approximation
   const north = dLat * EARTH_RADIUS_METERS;
   const east = dLon * (EARTH_RADIUS_METERS * Math.cos(meanLat));
   const up = alt - originAlt;
@@ -53,15 +53,102 @@ export function geodeticToEnu(
 }
 
 /**
- * Linearly interpolates lat/lon between consecutive GPS fixes.
- * The phone samples IMU at up to 100 Hz but GPS at ~1 Hz.
- * Consecutive samples with identical (lat, lon, gps_fix_t) are interpolated
- * between fix_A and fix_B using sample t.
+ * Infers the sequence step from the median of positive sequence deltas
+ * over the last 200 samples.
  */
-export function interpolateGpsSamples(samples: Sample[]): InterpolatedSample[] {
+export function inferSeqStep(samples: { seq: number }[]): number {
+  if (samples.length < 2) return 1;
+
+  // Take up to the last 200 samples
+  const recent = samples.length > 200 ? samples.slice(-200) : samples;
+  const positiveDeltas: number[] = [];
+
+  for (let i = 1; i < recent.length; i++) {
+    const delta = recent[i].seq - recent[i - 1].seq;
+    if (delta > 0) {
+      positiveDeltas.push(delta);
+    }
+  }
+
+  if (positiveDeltas.length === 0) return 1;
+
+  positiveDeltas.sort((a, b) => a - b);
+  const mid = Math.floor(positiveDeltas.length / 2);
+  const median = positiveDeltas[mid];
+  return Math.max(1, Math.round(median));
+}
+
+/**
+ * Calculates packet loss and rate details according to the specification:
+ * - Uses explicit seqStep if provided (> 0), otherwise infers step = median of positive deltas (last 200 samples)
+ * - Counts loss only when delta > 1.5 * step: lost += Math.round(delta / step) - 1
+ */
+export function calculatePacketLoss(
+  samples: { seq: number }[],
+  explicitStep?: number | null
+): { lost: number; received: number; expected: number; lossPct: number; step: number } {
+  if (samples.length === 0) {
+    return { lost: 0, received: 0, expected: 0, lossPct: 0.0, step: explicitStep || 1 };
+  }
+  if (samples.length === 1) {
+    return { lost: 0, received: 1, expected: 1, lossPct: 0.0, step: explicitStep || 1 };
+  }
+
+  const step = explicitStep && explicitStep > 0 ? explicitStep : inferSeqStep(samples);
+  let lost = 0;
+
+  for (let i = 1; i < samples.length; i++) {
+    const delta = samples[i].seq - samples[i - 1].seq;
+    if (delta > 1.5 * step) {
+      lost += Math.round(delta / step) - 1;
+    }
+  }
+
+  const expected = samples.length + lost;
+  const lossPct = expected > 0 ? (lost / expected) * 100 : 0;
+
+  return {
+    lost,
+    received: samples.length,
+    expected,
+    lossPct: parseFloat(lossPct.toFixed(1)),
+    step,
+  };
+}
+
+/**
+ * Computes median gps_alt of the first 5 valid fixes as the reference ground altitude.
+ */
+export function calculateStartGpsAltitude(samples: { gps_alt: number | null }[]): number | null {
+  const initialAlts: number[] = [];
+  for (const s of samples) {
+    if (s.gps_alt !== null && !isNaN(s.gps_alt)) {
+      initialAlts.push(s.gps_alt);
+      if (initialAlts.length >= 5) break;
+    }
+  }
+
+  if (initialAlts.length === 0) return null;
+  initialAlts.sort((a, b) => a - b);
+  const mid = Math.floor((initialAlts.length - 1) / 2);
+  return initialAlts[mid];
+}
+
+/**
+ * Linearly interpolates lat/lon between consecutive GPS fixes.
+ * Also computes relative height above start.
+ */
+export function interpolateGpsSamples(
+  samples: Sample[],
+  explicitStartAlt?: number | null
+): InterpolatedSample[] {
   if (samples.length === 0) return [];
 
   const result: InterpolatedSample[] = [];
+  const startAlt =
+    explicitStartAlt !== undefined && explicitStartAlt !== null
+      ? explicitStartAlt
+      : calculateStartGpsAltitude(samples);
 
   // Identify distinct GPS fix indices
   const fixIndices: number[] = [];
@@ -79,7 +166,6 @@ export function interpolateGpsSamples(samples: Sample[]): InterpolatedSample[] {
   let totalDist = 0;
   let prevLat: number | null = null;
   let prevLon: number | null = null;
-
   let currentFixPointer = 0;
 
   for (let i = 0; i < samples.length; i++) {
@@ -143,11 +229,15 @@ export function interpolateGpsSamples(samples: Sample[]): InterpolatedSample[] {
       s.mag_x * s.mag_x + s.mag_y * s.mag_y + s.mag_z * s.mag_z
     );
 
+    const heightAboveStart =
+      alt !== null && startAlt !== null ? alt - startAlt : null;
+
     result.push({
       ...s,
       lat,
       lon,
       gps_alt: alt,
+      heightAboveStart,
       isInterpolated,
       distanceMeters: totalDist,
       accelMag,
@@ -161,7 +251,6 @@ export function interpolateGpsSamples(samples: Sample[]): InterpolatedSample[] {
 
 /**
  * Largest-Triangle-Three-Buckets (LTTB) downsampling algorithm.
- * Reduces an array of points to a target threshold while preserving peaks and shapes.
  */
 export function lttbDownsample<T>(
   data: T[],
@@ -176,11 +265,10 @@ export function lttbDownsample<T>(
   const sampled: T[] = [];
   const bucketSize = (data.length - 2) / (threshold - 2);
 
-  let a = 0; // Initially first point
+  let a = 0;
   sampled.push(data[a]);
 
   for (let i = 0; i < threshold - 2; i++) {
-    // Calculate average point for the next bucket (bucket C)
     let avgX = 0;
     let avgY = 0;
     const avgRangeStart = Math.floor((i + 1) * bucketSize) + 1;
@@ -203,14 +291,12 @@ export function lttbDownsample<T>(
       avgY = getY(data[idx]);
     }
 
-    // Get the range for this bucket (bucket B)
     const rangeBStart = Math.floor(i * bucketSize) + 1;
     const rangeBEnd = Math.min(
       Math.floor((i + 1) * bucketSize) + 1,
       data.length
     );
 
-    // Point a
     const pointAX = getX(data[a]);
     const pointAY = getY(data[a]);
 
@@ -218,7 +304,6 @@ export function lttbDownsample<T>(
     let maxAreaPoint = rangeBStart;
 
     for (let j = rangeBStart; j < rangeBEnd; j++) {
-      // Calculate triangle area between point A, point B, and average point C
       const area = Math.abs(
         (pointAX - avgX) * (getY(data[j]) - pointAY) -
           (pointAX - getX(data[j])) * (avgY - pointAY)
@@ -233,7 +318,6 @@ export function lttbDownsample<T>(
     a = maxAreaPoint;
   }
 
-  // Always include the last point
   sampled.push(data[data.length - 1]);
   return sampled;
 }
@@ -271,7 +355,6 @@ export interface DeadReckoningResult {
 
 /**
  * Calculates dead-reckoning position between 1 Hz GPS fixes based on speed (m/s) and bearing (deg).
- * Allowed up to 2 seconds after the fix, when speed >= 1.0 m/s and accuracy is acceptable (<= 25m).
  */
 export function calculateDeadReckoning(
   lastFix: {
@@ -287,7 +370,6 @@ export function calculateDeadReckoning(
   const dtMs = nowMs - lastFix.fixTime;
   const dtSeconds = dtMs / 1000;
 
-  // Conditions: valid dt within 2 seconds, speed >= 1.0 m/s, bearing valid, accuracy acceptable
   const speed = lastFix.speed ?? 0;
   const bearing = lastFix.bearing;
   const acc = lastFix.gps_acc ?? 10;
@@ -325,3 +407,67 @@ export function calculateDeadReckoning(
   };
 }
 
+/**
+ * Derives comprehensive session statistics, including robust packet loss calculation
+ * and height-above-start metrics.
+ */
+export function deriveSessionStats(
+  samples: InterpolatedSample[],
+  explicitSeqStep?: number | null
+): SessionStats {
+  if (samples.length === 0) {
+    return {
+      durationSeconds: 0,
+      distanceMeters: 0,
+      maxSpeedKmh: 0,
+      maxAccelG: 0,
+      maxAltitudeMeters: 0,
+      startAltitudeMeters: null,
+      sampleCount: 0,
+      avgRateHz: 0,
+      packetsLost: 0,
+      lossPct: 0.0,
+      seqStep: explicitSeqStep || 1,
+    };
+  }
+
+  const firstT = samples[0].t;
+  const lastT = samples[samples.length - 1].t;
+  const durationSeconds = Math.max(0.1, (lastT - firstT) / 1000);
+
+  let maxSpeedMps = 0;
+  let maxAccelMs2 = 0;
+  let maxRelAlt = 0;
+
+  const startAlt = calculateStartGpsAltitude(samples);
+
+  for (const s of samples) {
+    if (s.speed !== null && s.speed > maxSpeedMps) maxSpeedMps = s.speed;
+    if (s.accelMag && s.accelMag > maxAccelMs2) maxAccelMs2 = s.accelMag;
+    
+    // Relative height above start
+    const relAlt = s.heightAboveStart !== undefined && s.heightAboveStart !== null
+      ? s.heightAboveStart
+      : (s.gps_alt !== null && startAlt !== null ? s.gps_alt - startAlt : 0);
+    
+    if (relAlt > maxRelAlt) maxRelAlt = relAlt;
+  }
+
+  const lossInfo = calculatePacketLoss(samples, explicitSeqStep);
+  const lastSample = samples[samples.length - 1];
+  const distanceMeters = lastSample.distanceMeters || 0;
+
+  return {
+    durationSeconds,
+    distanceMeters,
+    maxSpeedKmh: maxSpeedMps * 3.6,
+    maxAccelG: maxAccelMs2 / 9.80665,
+    maxAltitudeMeters: Math.max(0, maxRelAlt),
+    startAltitudeMeters: startAlt,
+    sampleCount: samples.length,
+    avgRateHz: Math.round(samples.length / durationSeconds),
+    packetsLost: lossInfo.lost,
+    lossPct: lossInfo.lossPct,
+    seqStep: lossInfo.step,
+  };
+}

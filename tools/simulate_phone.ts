@@ -5,12 +5,13 @@ interface CliArgs {
   url: string;
   deviceKey: string;
   rate: number;
-  profile: 'bike' | 'rocket';
+  profile: 'bike' | 'rocket' | 'stationary_indoor' | 'decimated_20hz';
   offlineAfter: number; // seconds (0 = disabled)
   offlineFor: number; // seconds
   startLat: number;
   startLon: number;
   sessionName?: string;
+  seqStep?: number;
 }
 
 function parseArgs(): CliArgs {
@@ -31,12 +32,24 @@ function parseArgs(): CliArgs {
     if (arg === '--url' && args[i + 1]) result.url = args[++i];
     else if (arg === '--device-key' && args[i + 1]) result.deviceKey = args[++i];
     else if (arg === '--rate' && args[i + 1]) result.rate = parseInt(args[++i], 10);
-    else if (arg === '--profile' && args[i + 1]) result.profile = args[++i] as any;
+    else if (arg === '--profile' && args[i + 1]) {
+      const p = args[++i].toLowerCase().replace(/-/g, '_');
+      result.profile = p as any;
+    }
     else if (arg === '--offline-after' && args[i + 1]) result.offlineAfter = parseFloat(args[++i]);
     else if (arg === '--offline-for' && args[i + 1]) result.offlineFor = parseFloat(args[++i]);
     else if (arg === '--lat' && args[i + 1]) result.startLat = parseFloat(args[++i]);
     else if (arg === '--lon' && args[i + 1]) result.startLon = parseFloat(args[++i]);
     else if (arg === '--name' && args[i + 1]) result.sessionName = args[++i];
+    else if (arg === '--seq-step' && args[i + 1]) result.seqStep = parseInt(args[++i], 10);
+  }
+
+  // Adjust defaults for profiles
+  if (result.profile === 'decimated_20hz') {
+    if (!args.includes('--rate')) result.rate = 20;
+    if (result.seqStep === undefined) result.seqStep = 5;
+  } else if (result.profile === 'stationary_indoor') {
+    if (!args.includes('--rate')) result.rate = 20;
   }
 
   return result;
@@ -48,9 +61,14 @@ async function uploadBatch(
   deviceId: string,
   batchId: string,
   samples: Sample[],
-  deviceKey: string
+  deviceKey: string,
+  seqStep?: number
 ): Promise<{ accepted: number; duplicates: number }> {
-  const payload = JSON.stringify({ deviceId, batchId, samples });
+  const payloadObj: any = { deviceId, batchId, samples };
+  if (seqStep !== undefined) {
+    payloadObj.seqStep = seqStep;
+  }
+  const payload = JSON.stringify(payloadObj);
   const compressed = zlib.gzipSync(Buffer.from(payload, 'utf-8'));
 
   const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/samples`, {
@@ -71,14 +89,20 @@ async function uploadBatch(
   return res.json() as Promise<{ accepted: number; duplicates: number }>;
 }
 
-async function startSession(baseUrl: string, deviceId: string, name: string, deviceKey: string) {
+async function startSession(
+  baseUrl: string,
+  deviceId: string,
+  name: string,
+  deviceKey: string,
+  source: 'phone' | 'sim' = 'sim'
+) {
   const res = await fetch(`${baseUrl}/api/sessions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': deviceKey,
     },
-    body: JSON.stringify({ deviceId, name, source: 'sim' }),
+    body: JSON.stringify({ deviceId, name, source }),
   });
 
   if (!res.ok) {
@@ -92,10 +116,19 @@ async function startSession(baseUrl: string, deviceId: string, name: string, dev
 async function run() {
   const config = parseArgs();
   const deviceId = `sim_phone_px8_${Math.random().toString(36).substring(2, 7)}`;
-  const defaultName =
-    config.profile === 'rocket'
-      ? `Sounding Rocket Flight #${Math.floor(Math.random() * 900) + 100}`
-      : `Bike Pillion Test - Chennai Circuit`;
+  let defaultName = `Bike Pillion Test - Chennai Circuit`;
+  let sessionSource: 'phone' | 'sim' = 'sim';
+
+  if (config.profile === 'rocket') {
+    defaultName = `Sounding Rocket Flight #${Math.floor(Math.random() * 900) + 100}`;
+  } else if (config.profile === 'stationary_indoor') {
+    defaultName = `Stationary Indoor Test - Weak Fix`;
+    sessionSource = 'phone';
+  } else if (config.profile === 'decimated_20hz') {
+    defaultName = `Phone Decimated 20Hz Stream (seqStep 5)`;
+    sessionSource = 'phone';
+  }
+
   const sessionName = config.sessionName || defaultName;
 
   console.log('====================================================');
@@ -103,15 +136,20 @@ async function run() {
   console.log(`Server Target: ${config.url}`);
   console.log(`Profile:       ${config.profile.toUpperCase()}`);
   console.log(`Sample Rate:   ${config.rate} Hz (batching 1s)`);
+  if (config.seqStep) {
+    console.log(`Seq Step:      ${config.seqStep}`);
+  }
   console.log(`Origin:        ${config.startLat}, ${config.startLon} (Chennai)`);
+  console.log(`Source Type:   ${sessionSource}`);
   if (config.offlineAfter > 0) {
     console.log(`Simulated Drop: After ${config.offlineAfter}s for ${config.offlineFor}s`);
   }
   console.log('====================================================');
 
-  const { sessionId } = await startSession(config.url, deviceId, sessionName, config.deviceKey);
+  const { sessionId } = await startSession(config.url, deviceId, sessionName, config.deviceKey, sessionSource);
   console.log(`Created Session: ${sessionId}`);
 
+  const step = config.seqStep || (config.profile === 'decimated_20hz' ? 5 : 1);
   let seq = 0;
   let batchIndex = 0;
   const startTime = Date.now();
@@ -120,7 +158,7 @@ async function run() {
   // GPS state
   let currentLat = config.startLat;
   let currentLon = config.startLon;
-  let currentGpsAlt = 12.0; // meters MSL
+  let currentGpsAlt = config.profile === 'stationary_indoor' || config.profile === 'decimated_20hz' ? -64.0 : 12.0; // meters (ellipsoid)
   let currentSpeed = 0.0; // m/s
   let currentBearing = 45.0; // deg
   let lastGpsFixTime = startTime;
@@ -148,7 +186,23 @@ async function run() {
       if (i === 0) {
         lastGpsFixTime = sampleTime;
 
-        if (config.profile === 'bike') {
+        if (config.profile === 'stationary_indoor') {
+          // Stationary indoors: no movement, speed 0, constant coordinates, weak GPS accuracy
+          currentLat = config.startLat + (Math.random() - 0.5) * 0.00001;
+          currentLon = config.startLon + (Math.random() - 0.5) * 0.00001;
+          currentGpsAlt = -64.0 + (Math.random() - 0.5) * 0.4;
+          currentSpeed = 0.0;
+          currentBearing = 0.0;
+        } else if (config.profile === 'decimated_20hz') {
+          // Decimated 20 Hz phone walk/jog: gentle motion around Chennai
+          const loopT = tSec * 0.05;
+          currentLat = config.startLat + 0.0008 * Math.sin(loopT);
+          currentLon = config.startLon + 0.0008 * Math.cos(loopT);
+          currentGpsAlt = -64.0 + 3.0 * Math.sin(loopT * 2);
+          currentSpeed = 1.4 + 0.4 * Math.sin(loopT); // walking pace ~ 1.4 m/s
+          currentBearing = (Math.atan2(Math.cos(loopT), -Math.sin(loopT)) * 180) / Math.PI;
+          if (currentBearing < 0) currentBearing += 360;
+        } else if (config.profile === 'bike') {
           // Bike loop simulation: parametric oval in Chennai
           // Speed: varies between 4 m/s and 9 m/s with occasional stops/turns
           const loopT = tSec * 0.04; // complete loop every ~150 seconds
@@ -192,18 +246,36 @@ async function run() {
         }
       }
 
-      // High-rate IMU sensors (100 Hz)
-      let ax = (Math.random() - 0.5) * 0.8;
-      let ay = (Math.random() - 0.5) * 0.8;
-      let az = 9.81 + (Math.random() - 0.5) * 0.8; // Gravity + noise
-      let gx = (Math.random() - 0.5) * 0.05;
-      let gy = (Math.random() - 0.5) * 0.05;
-      let gz = (Math.random() - 0.5) * 0.05;
+      // High-rate IMU sensors
+      let ax = (Math.random() - 0.5) * 0.1;
+      let ay = (Math.random() - 0.5) * 0.1;
+      let az = 9.81 + (Math.random() - 0.5) * 0.1;
+      let gx = (Math.random() - 0.5) * 0.01;
+      let gy = (Math.random() - 0.5) * 0.01;
+      let gz = (Math.random() - 0.5) * 0.01;
       let roll = 0;
       let pitch = 0;
       let yaw = currentBearing;
 
-      if (config.profile === 'bike') {
+      if (config.profile === 'stationary_indoor') {
+        // Table resting noise
+        ax = (Math.random() - 0.5) * 0.05;
+        ay = (Math.random() - 0.5) * 0.05;
+        az = 9.81 + (Math.random() - 0.5) * 0.05;
+        gx = (Math.random() - 0.5) * 0.002;
+        gy = (Math.random() - 0.5) * 0.002;
+        gz = (Math.random() - 0.5) * 0.002;
+        roll = 0.2;
+        pitch = -0.1;
+        yaw = 180.0;
+      } else if (config.profile === 'decimated_20hz') {
+        // Gentle walking sway
+        const stepRate = 2.0; // 2 steps/sec
+        az = 9.81 + Math.sin(tSec * 2 * Math.PI * stepRate) * 1.5 + (Math.random() - 0.5) * 0.3;
+        ax = Math.cos(tSec * Math.PI * stepRate) * 0.8 + (Math.random() - 0.5) * 0.2;
+        roll = Math.sin(tSec * Math.PI * stepRate) * 4.0;
+        pitch = Math.cos(tSec * 2 * Math.PI * stepRate) * 2.0;
+      } else if (config.profile === 'bike') {
         // Road bump vibrations + turn banking
         const roadBump = Math.sin(tSec * 45) * 0.7 + (Math.random() - 0.5) * 1.2;
         az += roadBump;
@@ -241,7 +313,7 @@ async function run() {
       const mz = -18.0 + (Math.random() - 0.5) * 1.5;
 
       const sample: Sample = {
-        seq: seq++,
+        seq: seq,
         t: sampleTime,
         accel_x: parseFloat(ax.toFixed(3)),
         accel_y: parseFloat(ay.toFixed(3)),
@@ -262,17 +334,20 @@ async function run() {
         lon: parseFloat(currentLon.toFixed(7)),
         gps_alt: parseFloat(currentGpsAlt.toFixed(1)),
         speed: parseFloat(currentSpeed.toFixed(2)),
-        sats: 12,
-        gps_acc: 3.2,
+        sats: config.profile === 'stationary_indoor' ? 3 : 12,
+        gps_acc: config.profile === 'stationary_indoor' ? 32.5 : 3.2,
         bearing: parseFloat(currentBearing.toFixed(1)),
         gps_fix_t: lastGpsFixTime,
+        gps_provider: config.profile === 'stationary_indoor' ? 'fused' : 'gps',
+        gps_msl_alt: config.profile === 'decimated_20hz' ? 14.2 : null,
         batt: batteryPct,
         batt_temp: parseFloat((batteryTemp + Math.sin(tSec * 0.05) * 0.5).toFixed(1)),
-        sats_visible: 16,
+        sats_visible: config.profile === 'stationary_indoor' ? 5 : 16,
         gps_cn0: parseFloat((33.5 + Math.sin(tSec * 0.1) * 2.0).toFixed(1)),
         gps_age_ms: Math.floor(Math.random() * 200) + 100,
       };
 
+      seq += step;
       batchSamples.push(sample);
       simTimeSeconds += 1 / config.rate;
     }
@@ -291,7 +366,7 @@ async function run() {
         while (offlineQueue.length > 0) {
           const item = offlineQueue.shift()!;
           try {
-            const res = await uploadBatch(config.url, sessionId, deviceId, item.batchId, item.samples, config.deviceKey);
+            const res = await uploadBatch(config.url, sessionId, deviceId, item.batchId, item.samples, config.deviceKey, config.seqStep);
             console.log(`   -> Flushed backlog batch ${item.batchId} (accepted: ${res.accepted})`);
           } catch (e: any) {
             console.error(`   -> Failed flushing backlog batch: ${e.message}`);
@@ -305,14 +380,18 @@ async function run() {
       console.log(`[OFFLINE] Queued batch ${batchId} (${batchSamples.length} samples, queue size: ${offlineQueue.length})`);
     } else {
       try {
-        const res = await uploadBatch(config.url, sessionId, deviceId, batchId, batchSamples, config.deviceKey);
+        const res = await uploadBatch(config.url, sessionId, deviceId, batchId, batchSamples, config.deviceKey, config.seqStep);
         console.log(
-          `[LIVE T+${simTimeSeconds.toFixed(0)}s] Batch #${batchIndex} uploaded (${batchSamples.length} samples) | Speed: ${currentSpeed.toFixed(1)} m/s | Alt: ${currentGpsAlt.toFixed(1)} m | Accepted: ${res.accepted}`
+          `[LIVE T+${simTimeSeconds.toFixed(0)}s] Batch #${batchIndex} uploaded (${batchSamples.length} samples, seqStep: ${step}) | Speed: ${currentSpeed.toFixed(1)} m/s | Alt: ${currentGpsAlt.toFixed(1)} m | Provider: ${batchSamples[0]?.gps_provider} | Acc: ±${batchSamples[0]?.gps_acc}m | Accepted: ${res.accepted}`
         );
       } catch (err: any) {
         console.error(`Upload error: ${err.message}`);
       }
     }
+  };
+
+  // Run continuous loop every 1 second
+  setInterval(tick, 1000);
   };
 
   // Run continuous loop every 1 second

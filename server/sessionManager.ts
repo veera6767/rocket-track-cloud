@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws';
 import { Sample, WsServerMessage, SessionRecord } from '../shared/types.js';
 import { ITelemetryRepository } from './repository.js';
+import { inferSeqStep } from '../shared/math.js';
 
 interface ViewerClient {
   ws: WebSocket;
@@ -21,7 +22,19 @@ export class SessionManager {
   private currentRatePerSec: Map<string, number> = new Map();
   private sessionDevices: Map<string, string> = new Map();
   private sessionSources: Map<string, 'phone' | 'sim' | 'fc'> = new Map();
-  private lastGpsFix: Map<string, { lat: number | null; lon: number | null; fixTime: number | null; sats: number | null; satsVisible: number | null }> = new Map();
+  private sessionSeqStep: Map<string, number> = new Map();
+  private lastGpsFix: Map<
+    string,
+    {
+      lat: number | null;
+      lon: number | null;
+      fixTime: number | null;
+      sats: number | null;
+      satsVisible: number | null;
+      acc: number | null;
+      provider: string | null;
+    }
+  > = new Map();
   private lastGpsFixTime: Map<string, number | null> = new Map();
 
   private viewers: Set<ViewerClient> = new Set();
@@ -56,10 +69,12 @@ export class SessionManager {
           client.actualSessionId &&
           now - client.lastFlushTime >= 95
         ) {
+          const step = this.sessionSeqStep.get(client.actualSessionId) || 1;
           const batchMsg: WsServerMessage = {
             type: 'batch',
             sessionId: client.actualSessionId,
             samples: client.pendingSamples,
+            seqStep: step,
           };
           client.ws.send(JSON.stringify(batchMsg));
           client.pendingSamples = [];
@@ -68,7 +83,7 @@ export class SessionManager {
       }
     }, 50);
 
-    // 3. Status push once per second: ratePerSec, deviceOnline, gps
+    // 3. Status push once per second: ratePerSec, deviceOnline, gps, seqStep
     this.statusInterval = setInterval(async () => {
       const now = Date.now();
       // Calculate rates
@@ -87,6 +102,7 @@ export class SessionManager {
         const rate = this.currentRatePerSec.get(sessionId) ?? 0;
         const deviceId = this.sessionDevices.get(sessionId);
         const source = this.sessionSources.get(sessionId);
+        const seqStep = this.sessionSeqStep.get(sessionId) || 1;
         const gpsInfo = this.lastGpsFix.get(sessionId);
         const ageMs = gpsInfo?.fixTime ? Math.max(0, now - gpsInfo.fixTime) : null;
 
@@ -97,14 +113,19 @@ export class SessionManager {
           ratePerSec: rate,
           deviceId,
           source,
-          gps: gpsInfo ? {
-            lat: gpsInfo.lat,
-            lon: gpsInfo.lon,
-            fixTime: gpsInfo.fixTime,
-            ageMs,
-            sats: gpsInfo.sats,
-            satsVisible: gpsInfo.satsVisible,
-          } : undefined,
+          seqStep,
+          gps: gpsInfo
+            ? {
+                lat: gpsInfo.lat,
+                lon: gpsInfo.lon,
+                fixTime: gpsInfo.fixTime,
+                ageMs,
+                sats: gpsInfo.sats,
+                satsVisible: gpsInfo.satsVisible,
+                acc: gpsInfo.acc,
+                provider: gpsInfo.provider,
+              }
+            : undefined,
         };
         client.ws.send(JSON.stringify(statusMsg));
       }
@@ -124,11 +145,17 @@ export class SessionManager {
   }
 
   public onSessionStarted(record: SessionRecord) {
-    const isSim = record.source === 'sim' || record.deviceId?.toLowerCase().startsWith('sim') || record.deviceId?.toLowerCase().includes('simulator');
+    const isSim =
+      record.source === 'sim' ||
+      record.deviceId?.toLowerCase().startsWith('sim') ||
+      record.deviceId?.toLowerCase().includes('simulator');
     const source: 'phone' | 'sim' | 'fc' = record.source || (isSim ? 'sim' : 'phone');
 
     this.sessionDevices.set(record.id, record.deviceId);
     this.sessionSources.set(record.id, source);
+    if (record.seqStep) {
+      this.sessionSeqStep.set(record.id, record.seqStep);
+    }
 
     const msg: WsServerMessage = { type: 'session_started', session: { ...record, source } };
     const str = JSON.stringify(msg);
@@ -160,7 +187,6 @@ export class SessionManager {
         if (source) this.sessionSources.set(actualSessionId, source);
       }
     } else if (requestedSession === 'latest') {
-      // Prioritize phone session, but fall back to latest if none
       const latestPhone = await this.repo.getLatestPhoneSession();
       const latest = latestPhone || (await this.repo.getLatestSession());
       actualSessionId = latest?.id ?? null;
@@ -193,14 +219,13 @@ export class SessionManager {
 
     // Send hello message
     if (actualSessionId) {
-      ws.send(JSON.stringify({ type: 'hello', sessionId: actualSessionId, deviceId, source }));
+      const seqStep = this.sessionSeqStep.get(actualSessionId) || 1;
+      ws.send(JSON.stringify({ type: 'hello', sessionId: actualSessionId, deviceId, source, seqStep }));
 
       // Send last ~15s of samples so the view is never empty
       let ring = this.ringBuffers.get(actualSessionId);
       if (!ring || ring.length === 0) {
-        // Hydrate from DB if ring is empty
         const recentSamples = await this.repo.getSamples(actualSessionId, undefined, undefined, 1);
-        // Take up to the last 1500 samples
         ring = recentSamples.slice(-1500);
         if (ring.length > 0) {
           this.ringBuffers.set(actualSessionId, ring);
@@ -208,12 +233,15 @@ export class SessionManager {
       }
 
       if (ring && ring.length > 0) {
+        const inferred = this.sessionSeqStep.get(actualSessionId) || inferSeqStep(ring);
+        this.sessionSeqStep.set(actualSessionId, inferred);
         ws.send(
           JSON.stringify({
             type: 'batch',
             sessionId: actualSessionId,
             samples: ring,
             isBackfill: true,
+            seqStep: inferred,
           })
         );
       }
@@ -229,10 +257,10 @@ export class SessionManager {
           lastSampleAt: lastT,
           ratePerSec: this.currentRatePerSec.get(actualSessionId) ?? 0,
           deviceId: this.sessionDevices.get(actualSessionId),
+          seqStep: this.sessionSeqStep.get(actualSessionId) || 1,
         })
       );
     } else {
-      // No sessions yet
       ws.send(JSON.stringify({ type: 'hello', sessionId: '' }));
       ws.send(
         JSON.stringify({
@@ -253,11 +281,21 @@ export class SessionManager {
     });
   }
 
-  public async onNewSamples(sessionId: string, samples: Sample[], isBackfill: boolean = false, deviceId?: string) {
+  public async onNewSamples(
+    sessionId: string,
+    samples: Sample[],
+    isBackfill: boolean = false,
+    deviceId?: string,
+    seqStep?: number
+  ) {
     if (samples.length === 0) return;
 
     if (deviceId) {
       this.sessionDevices.set(sessionId, deviceId);
+    }
+
+    if (seqStep && seqStep > 0) {
+      this.sessionSeqStep.set(sessionId, seqStep);
     }
 
     const now = Date.now();
@@ -281,6 +319,8 @@ export class SessionManager {
           fixTime: s.gps_fix_t,
           sats: s.sats,
           satsVisible: s.sats_visible ?? null,
+          acc: s.gps_acc ?? null,
+          provider: s.gps_provider ?? null,
         });
       }
     }
@@ -292,26 +332,30 @@ export class SessionManager {
       this.ringBuffers.set(sessionId, ring);
     }
     ring.push(...samples);
-    // Sort ring by seq/t to maintain proper order even with out-of-order batches
     ring.sort((a, b) => a.seq - b.seq);
     if (ring.length > 3000) {
       ring.splice(0, ring.length - 3000);
     }
 
+    // Infer step if not explicitly supplied
+    if (!this.sessionSeqStep.has(sessionId)) {
+      const inferred = inferSeqStep(ring);
+      this.sessionSeqStep.set(sessionId, inferred);
+    }
+
+    const currentStep = this.sessionSeqStep.get(sessionId) || 1;
+
     // Broadcast to viewers
     for (const client of this.viewers) {
       if (client.ws.readyState !== WebSocket.OPEN) continue;
 
-      // Handle 'latest' resolution dynamically if needed
       if (client.requestedSession === 'latest' && client.actualSessionId !== sessionId) {
         client.actualSessionId = sessionId;
-        client.ws.send(JSON.stringify({ type: 'hello', sessionId }));
+        client.ws.send(JSON.stringify({ type: 'hello', sessionId, seqStep: currentStep }));
       }
 
       if (client.actualSessionId === sessionId) {
         if (isBackfill || hasNewGpsFix) {
-          // Immediately broadcast backfill batch OR batch with a new GPS fix!
-          // Include any previously queued samples to preserve sequence order
           const allSamples = isBackfill ? samples : [...client.pendingSamples, ...samples];
           client.pendingSamples = [];
           client.lastFlushTime = now;
@@ -321,14 +365,31 @@ export class SessionManager {
               sessionId,
               samples: allSamples,
               isBackfill: isBackfill || false,
+              seqStep: currentStep,
             })
           );
         } else {
-          // Normal streaming batch: add to client's throttle queue
           client.pendingSamples.push(...samples);
         }
       }
     }
+  }
+
+  public getSessionSeqStep(sessionId: string): number {
+    return this.sessionSeqStep.get(sessionId) || 1;
+  }
+
+  public async handleConnection(ws: WebSocket, requestedSession?: string | null) {
+    await this.registerViewer(ws, requestedSession || 'latest');
+  }
+
+  public async ingestSamples(
+    sessionId: string,
+    samples: Sample[],
+    seqStep?: number,
+    deviceId?: string
+  ) {
+    await this.onNewSamples(sessionId, samples, false, deviceId, seqStep);
   }
 
   public dispose() {
@@ -336,5 +397,11 @@ export class SessionManager {
     if (this.statusInterval) clearInterval(this.statusInterval);
     if (this.flushInterval) clearInterval(this.flushInterval);
     if (this.inactivityInterval) clearInterval(this.inactivityInterval);
+    for (const client of this.viewers) {
+      try {
+        client.ws.close();
+      } catch {}
+    }
+    this.viewers.clear();
   }
 }

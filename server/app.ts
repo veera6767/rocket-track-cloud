@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { ITelemetryRepository } from './repository.js';
 import { SessionManager } from './sessionManager.js';
 import { Sample } from '../shared/types.js';
+import { interpolateGpsSamples, deriveSessionStats } from '../shared/math.js';
 
 export const DEVICE_KEY = process.env.DEVICE_KEY || 'rocket_device_secret_2026';
 export const VIEWER_KEY = process.env.VIEWER_KEY || 'ground_station_viewer_2026';
@@ -76,6 +77,8 @@ const sampleSchema = z.object({
   sats_visible: z.number().int().nullable().optional(),
   gps_cn0: z.number().nullable().optional(),
   gps_age_ms: z.number().int().nullable().optional(),
+  gps_msl_alt: z.number().nullable().optional(),
+  gps_provider: z.string().nullable().optional(),
 }).passthrough();
 
 const createSessionSchema = z.object({
@@ -87,6 +90,7 @@ const createSessionSchema = z.object({
 const samplesBatchSchema = z.object({
   deviceId: z.string().min(1),
   batchId: z.string().min(1),
+  seqStep: z.number().int().positive().optional(),
   samples: z.array(sampleSchema),
 }).passthrough();
 
@@ -298,7 +302,7 @@ export function createExpressApp(repo: ITelemetryRepository, sessionManager: Ses
       return;
     }
 
-    const { samples, batchId, deviceId } = parsed.data;
+    const { samples, batchId, deviceId, seqStep } = parsed.data;
     const now = Date.now();
 
     // Insert into DB (idempotent ON CONFLICT DO NOTHING)
@@ -316,13 +320,14 @@ export function createExpressApp(repo: ITelemetryRepository, sessionManager: Ses
         accepted: result.accepted,
         duplicates: result.duplicates,
         latencyMs,
+        seqStep,
       },
       '[Ingest] Batch received'
     );
 
     // Fan-out to connected WebSocket viewers
     const isBackfill = latencyMs > 5000;
-    await sessionManager.onNewSamples(id, samples as Sample[], isBackfill, deviceId);
+    await sessionManager.onNewSamples(id, samples as Sample[], isBackfill, deviceId, seqStep);
 
     res.json(result);
   });
@@ -388,13 +393,25 @@ export function createExpressApp(repo: ITelemetryRepository, sessionManager: Ses
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="rocket_track_${id}.csv"`);
 
+    const samplesList = await repo.getSamples(id);
+    const interpolated = interpolateGpsSamples(samplesList);
+    const seqStep = sessionManager.getSessionSeqStep(id);
+    const stats = deriveSessionStats(interpolated, seqStep);
+
+    res.write(`# ROCKET TRACK CLOUD Telemetry Export\n`);
+    res.write(`# Session: ${session.name} (${id})\n`);
+    res.write(`# Source: ${session.source || 'phone'}\n`);
+    res.write(`# Samples: ${stats.sampleCount}, Duration: ${stats.durationSeconds.toFixed(1)}s, Rate: ${stats.avgRateHz} Hz (seq step ${stats.seqStep})\n`);
+    res.write(`# Packet Loss: ${stats.lossPct.toFixed(1)}% (${stats.packetsLost} lost)\n`);
+    res.write(`# Max Altitude (Height above start): ${stats.maxAltitudeMeters.toFixed(1)} m\n`);
+
     const header = [
       'seq', 't', 'accel_x', 'accel_y', 'accel_z',
       'gyro_x', 'gyro_y', 'gyro_z', 'mag_x', 'mag_y', 'mag_z',
       'roll', 'pitch', 'yaw', 'pressure', 'altitude', 'prox',
       'lat', 'lon', 'gps_alt', 'speed', 'sats', 'gps_acc',
       'bearing', 'gps_fix_t', 'batt', 'batt_temp',
-      'sats_visible', 'gps_cn0', 'gps_age_ms'
+      'sats_visible', 'gps_cn0', 'gps_age_ms', 'gps_msl_alt', 'gps_provider'
     ].join(',');
 
     res.write(header + '\n');
@@ -430,7 +447,9 @@ export function createExpressApp(repo: ITelemetryRepository, sessionManager: Ses
         sample.batt_temp,
         sample.sats_visible ?? '',
         sample.gps_cn0 ?? '',
-        sample.gps_age_ms ?? ''
+        sample.gps_age_ms ?? '',
+        sample.gps_msl_alt ?? '',
+        sample.gps_provider ?? ''
       ].join(',');
       res.write(row + '\n');
     });

@@ -202,6 +202,8 @@ export const ThreeTrailViewer: React.FC = () => {
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
+    controls.maxPolarAngle = Math.PI / 2 - 0.04; // Never dip below ground level
+    controls.minDistance = 2;
     controls.maxPolarAngle = Math.PI / 2 - 0.02; // Keep slightly above ground
     controls.minDistance = 2;
     controls.maxDistance = 5000;
@@ -495,14 +497,20 @@ export const ThreeTrailViewer: React.FC = () => {
               rocketMeshGroupRef.current?.quaternion.slerp(_targetQuat, 0.2);
             }
 
-            // Drop line from head to ground
+            // Drop line from head to ground: only visible when height > 1m and length clamped
             if (dropLineRef.current) {
-              const geom = dropLineRef.current.geometry;
-              const posAttr = geom.getAttribute('position') as THREE.BufferAttribute;
-              posAttr.setXYZ(0, posX, 0, posZ);
-              posAttr.setXYZ(1, posX, posY, posZ);
-              posAttr.needsUpdate = true;
-              dropLineRef.current.computeLineDistances();
+              if (posY > 1.0) {
+                dropLineRef.current.visible = true;
+                const geom = dropLineRef.current.geometry;
+                const posAttr = geom.getAttribute('position') as THREE.BufferAttribute;
+                const dropLen = Math.min(posY, 1000);
+                posAttr.setXYZ(0, posX, Math.max(0, posY - dropLen), posZ);
+                posAttr.setXYZ(1, posX, posY, posZ);
+                posAttr.needsUpdate = true;
+                dropLineRef.current.computeLineDistances();
+              } else {
+                dropLineRef.current.visible = false;
+              }
             }
 
             // Ground ring under vehicle
@@ -520,29 +528,28 @@ export const ThreeTrailViewer: React.FC = () => {
               setHeadScreenPos(null);
             }
 
-            // Camera follow modes
+            // Camera follow modes (framed with at least 30m scene extent)
             if (state.cameraPreset === 'follow') {
-              // FOLLOW mode: Behind and above head at about 30 degrees
               let backAngleRad = 0;
               if (s.bearing !== null) {
                 backAngleRad = (s.bearing * Math.PI) / 180;
               }
-              const followDist = Math.max(16, clampedScale * 12);
+              const followDist = Math.max(30, clampedScale * 12);
               const camTargetX = posX - Math.sin(backAngleRad) * followDist;
               const camTargetZ = posZ + Math.cos(backAngleRad) * followDist;
-              const camTargetY = posY + followDist * 0.55; // 30 deg elevation
+              const camTargetY = Math.max(5, posY + followDist * 0.55); // Never below ground
 
               _camPos.set(camTargetX, camTargetY, camTargetZ);
-              _camTarget.set(posX, posY, posZ);
+              _camTarget.set(posX, Math.max(0.1, posY), posZ);
 
               camera.position.lerp(_camPos, 0.08);
               controls.target.lerp(_camTarget, 0.08);
             } else if (state.cameraPreset === 'top') {
-              _camPos.set(posX, posY + 80, posZ);
+              _camPos.set(posX, Math.max(30, posY + 80), posZ);
               camera.position.lerp(_camPos, 0.08);
               controls.target.lerp(_vecA.set(posX, posY, posZ), 0.08);
             } else if (state.cameraPreset === 'side') {
-              _camPos.set(posX + 80, posY + 10, posZ);
+              _camPos.set(posX + 80, Math.max(5, posY + 10), posZ);
               camera.position.lerp(_camPos, 0.08);
               controls.target.lerp(_vecA.set(posX, posY, posZ), 0.08);
             }
@@ -739,11 +746,25 @@ export const ThreeTrailViewer: React.FC = () => {
     }
 
     // Compute bounding box for Overview and Follow framing
-    const bbox = new THREE.Box3().setFromPoints(points);
+    const bbox = new THREE.Box3();
+    if (points.length > 0) {
+      bbox.setFromPoints(points);
+    }
     const center = new THREE.Vector3();
-    bbox.getCenter(center);
+    if (points.length > 0) {
+      bbox.getCenter(center);
+    }
+    const size = new THREE.Vector3();
+    bbox.getSize(size);
+
+    // If trail is shorter than 30m, center on latest marker and enforce minimum 30m scene extent
+    const trailLen = points.length > 1 ? points[0].distanceTo(points[points.length - 1]) : 0;
+    if (trailLen < 30 && points.length > 0) {
+      center.copy(points[points.length - 1]);
+    }
+    const extent = Math.max(size.x, size.y, size.z, 30);
     boundingCenterRef.current.copy(center);
-    trailExtentRef.current = Math.max(25, bbox.getSize(new THREE.Vector3()).length());
+    trailExtentRef.current = extent;
   }, [interpolatedSamples, originGps, verticalExaggeration, colorMetric, trailStyle]);
 
   // Handle Quick Toolbar actions
@@ -752,7 +773,11 @@ export const ThreeTrailViewer: React.FC = () => {
     if (cameraRef.current && controlsRef.current) {
       const center = boundingCenterRef.current;
       const extent = trailExtentRef.current;
-      cameraRef.current.position.set(center.x + extent * 0.7, center.y + extent * 0.6, center.z + extent * 0.7);
+      cameraRef.current.position.set(
+        center.x + extent * 0.7,
+        Math.max(5, center.y + extent * 0.6),
+        center.z + extent * 0.7
+      );
       controlsRef.current.target.copy(center);
       controlsRef.current.update();
     }
@@ -763,7 +788,11 @@ export const ThreeTrailViewer: React.FC = () => {
     if (cameraRef.current && controlsRef.current) {
       const center = boundingCenterRef.current;
       const extent = trailExtentRef.current;
-      cameraRef.current.position.set(center.x, center.y + extent * 1.2, center.z);
+      cameraRef.current.position.set(
+        center.x,
+        Math.max(30, center.y + extent * 1.3),
+        center.z
+      );
       controlsRef.current.target.copy(center);
       controlsRef.current.update();
     }
@@ -774,7 +803,11 @@ export const ThreeTrailViewer: React.FC = () => {
     if (cameraRef.current && controlsRef.current) {
       const center = boundingCenterRef.current;
       const extent = trailExtentRef.current;
-      cameraRef.current.position.set(center.x + extent * 1.2, center.y + 10, center.z);
+      cameraRef.current.position.set(
+        center.x + extent * 1.3,
+        Math.max(5, center.y + 10),
+        center.z
+      );
       controlsRef.current.target.copy(center);
       controlsRef.current.update();
     }
@@ -931,6 +964,14 @@ export const ThreeTrailViewer: React.FC = () => {
         </button>
       </div>
 
+      {/* Stationary Badge */}
+      {(!latestSample || latestSample.speed === null || latestSample.speed === undefined || latestSample.speed < 0.5) && (
+        <div className="absolute top-3 right-14 z-20 flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#FBBF24]/20 border border-[#FBBF24]/50 text-[#FBBF24] font-mono text-[11px] font-bold shadow-md backdrop-blur">
+          <span className="w-1.5 h-1.5 rounded-full bg-[#FBBF24] animate-pulse" />
+          <span>STATIONARY</span>
+        </div>
+      )}
+
       {/* Floating Info Label Following Vehicle Head */}
       {headScreenPos && latestSample && (
         <div
@@ -941,13 +982,19 @@ export const ThreeTrailViewer: React.FC = () => {
           }}
         >
           <span className="text-[#38BDF8] font-bold">
-            {latestSample.speed ? `${(latestSample.speed * 3.6).toFixed(0)} km/h` : '--'}
+            {latestSample.speed ? `${(latestSample.speed * 3.6).toFixed(0)} km/h` : '0 km/h'}
           </span>
           <span className="text-[#243049]">|</span>
-          <span>{latestSample.gps_alt ? `${latestSample.gps_alt.toFixed(1)}m` : '--'}</span>
+          <span>
+            {latestSample.heightAboveStart !== null && latestSample.heightAboveStart !== undefined
+              ? `${latestSample.heightAboveStart.toFixed(1)}m`
+              : latestSample.gps_alt
+              ? `${latestSample.gps_alt.toFixed(1)}m`
+              : '0.0m'}
+          </span>
           <span className="text-[#243049]">|</span>
           <span className="text-[#8A97AD]">
-            |a| {latestSample.accelMag ? `${latestSample.accelMag.toFixed(1)}` : '--'}
+            |a| {latestSample.accelMag ? `${latestSample.accelMag.toFixed(1)}` : '1.0g'}
           </span>
         </div>
       )}
@@ -1100,14 +1147,14 @@ export const ThreeTrailViewer: React.FC = () => {
   );
 };
 
-// Helper: Canvas Text Sprite for reference markers in 3D scene
+// Helper: Canvas Text Sprite for reference markers in 3D scene (constant on-screen size, clamped 12-16px)
 function createTextSprite(text: string, color: string, scale: number = 1.0): THREE.Sprite {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
   canvas.height = 64;
   const ctx = canvas.getContext('2d');
   if (ctx) {
-    ctx.fillStyle = 'rgba(17, 24, 38, 0.85)';
+    ctx.fillStyle = 'rgba(17, 24, 38, 0.9)';
     ctx.roundRect(4, 4, 248, 56, 8);
     ctx.fill();
     ctx.strokeStyle = '#243049';
@@ -1115,7 +1162,7 @@ function createTextSprite(text: string, color: string, scale: number = 1.0): THR
     ctx.stroke();
 
     ctx.fillStyle = color;
-    ctx.font = 'bold 24px JetBrains Mono, monospace';
+    ctx.font = 'bold 22px JetBrains Mono, monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(text, 128, 32);
@@ -1123,8 +1170,17 @@ function createTextSprite(text: string, color: string, scale: number = 1.0): THR
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.minFilter = THREE.LinearFilter;
-  const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false, transparent: true });
+  // sizeAttenuation: false ensures the text keeps a constant on-screen size
+  const spriteMat = new THREE.SpriteMaterial({
+    map: texture,
+    depthTest: false,
+    transparent: true,
+    sizeAttenuation: false,
+  });
   const sprite = new THREE.Sprite(spriteMat);
-  sprite.scale.set(6 * scale, 1.5 * scale, 1.0);
+  const targetPxHeight = Math.max(12, Math.min(16, 14 * scale));
+  const scaleY = targetPxHeight / 600;
+  const scaleX = scaleY * 4.0;
+  sprite.scale.set(scaleX, scaleY, 1.0);
   return sprite;
 }

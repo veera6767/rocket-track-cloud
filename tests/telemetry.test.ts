@@ -2,17 +2,22 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import http from 'http';
 import zlib from 'zlib';
 import fs from 'fs';
+import { WebSocketServer, WebSocket } from 'ws';
 import { SqliteRepository } from '../server/repository.js';
 import { SessionManager } from '../server/sessionManager.js';
-import { createExpressApp, DEVICE_KEY, VIEWER_KEY, ADMIN_KEY } from '../server/app.js';
+import { createExpressApp, isViewerAuthorized, DEVICE_KEY, VIEWER_KEY, ADMIN_KEY } from '../server/app.js';
 import {
   haversineDistance,
   geodeticToEnu,
   interpolateGpsSamples,
   lttbDownsample,
   calculateDeadReckoning,
+  inferSeqStep,
+  calculatePacketLoss,
+  calculateStartGpsAltitude,
+  deriveSessionStats,
 } from '../shared/math.js';
-import { Sample } from '../shared/types.js';
+import { Sample, WsServerMessage } from '../shared/types.js';
 
 const TEST_DB = './test_telemetry.sqlite';
 
@@ -407,5 +412,333 @@ describe('Mathematical Algorithms & Dead Reckoning', () => {
     // The extreme spike at x=500 must be retained by LTTB
     const peak = downsampled.find((d) => d.y === 999.0);
     expect(peak).toBeDefined();
+  });
+});
+
+describe('Packet Loss & Seq Step Inference', () => {
+  it('infers seqStep correctly from decimated stream deltas', () => {
+    // 100 Hz downsampled to 20 Hz gives deltas of 5
+    const samples = [
+      createMockSample(0, 1000),
+      createMockSample(5, 1050),
+      createMockSample(10, 1100),
+      createMockSample(15, 1150),
+      createMockSample(20, 1200),
+    ];
+    expect(inferSeqStep(samples)).toBe(5);
+
+    // Standard 100 Hz stream gives deltas of 1
+    const normalSamples = [
+      createMockSample(0, 1000),
+      createMockSample(1, 1010),
+      createMockSample(2, 1020),
+    ];
+    expect(inferSeqStep(normalSamples)).toBe(1);
+  });
+
+  it('unit test: seq 0, 5, 10, 20 means exactly one lost sample', () => {
+    const samples = [
+      createMockSample(0, 1000),
+      createMockSample(5, 1050),
+      createMockSample(10, 1100),
+      createMockSample(20, 1200), // Jump by 10 (seq 15 was lost)
+    ];
+
+    const stats = calculatePacketLoss(samples);
+    expect(stats.step).toBe(5);
+    expect(stats.received).toBe(4);
+    expect(stats.lost).toBe(1); // Exactly one lost sample
+    expect(stats.lossPct).toBeCloseTo(20.0, 1);
+  });
+
+  it('reports 0% packet loss for clean decimated 20 Hz stream', () => {
+    const samples = [
+      createMockSample(0, 1000),
+      createMockSample(5, 1050),
+      createMockSample(10, 1100),
+      createMockSample(15, 1150),
+      createMockSample(20, 1200),
+    ];
+
+    const stats = calculatePacketLoss(samples, 5);
+    expect(stats.step).toBe(5);
+    expect(stats.lost).toBe(0);
+    expect(stats.lossPct).toBe(0.0);
+  });
+});
+
+describe('Altitude & Height Above Start Calculations', () => {
+  it('calculates start GPS altitude as the median of the first 5 valid fixes', () => {
+    const samples = [
+      createMockSample(0, 1000),
+      createMockSample(1, 1050),
+      createMockSample(2, 1100),
+      createMockSample(3, 1150),
+      createMockSample(4, 1200),
+    ];
+
+    // South India WGS-84 ellipsoid altitudes (~ -64m)
+    samples[0].gps_alt = -64.2;
+    samples[1].gps_alt = -63.8;
+    samples[2].gps_alt = -64.0;
+    samples[3].gps_alt = -64.5;
+    samples[4].gps_alt = -63.9;
+    // Sorted: -64.5, -64.2, -64.0, -63.9, -63.8 -> median is -64.0
+
+    const startAlt = calculateStartGpsAltitude(samples);
+    expect(startAlt).toBe(-64.0);
+  });
+
+  it('ignores null gps_alt samples when computing start altitude', () => {
+    const samples = [
+      createMockSample(0, 1000),
+      createMockSample(1, 1050),
+      createMockSample(2, 1100),
+      createMockSample(3, 1150),
+      createMockSample(4, 1200),
+      createMockSample(5, 1250),
+    ];
+    samples[0].gps_alt = null; // No 3D fix yet
+    samples[1].gps_alt = -64.0;
+    samples[2].gps_alt = -64.0;
+    samples[3].gps_alt = -64.0;
+    samples[4].gps_alt = -64.0;
+    samples[5].gps_alt = -64.0;
+
+    const startAlt = calculateStartGpsAltitude(samples);
+    expect(startAlt).toBe(-64.0);
+  });
+
+  it('computes heightAboveStart in interpolateGpsSamples relative to start altitude', () => {
+    const samples = [
+      createMockSample(0, 1000, 13.0, 80.0),
+      createMockSample(1, 2000, 13.0, 80.0),
+    ];
+    samples[0].gps_alt = -64.0;
+    samples[1].gps_alt = -44.0; // Climbed +20m
+
+    const interpolated = interpolateGpsSamples(samples, -64.0);
+    expect(interpolated[0].heightAboveStart).toBeCloseTo(0.0, 1);
+    expect(interpolated[1].heightAboveStart).toBeCloseTo(20.0, 1);
+  });
+
+  it('derives session stats with maxAltitude relative to start altitude', () => {
+    const samples = [
+      createMockSample(0, 1000, 13.0, 80.0),
+      createMockSample(1, 1010, 13.0, 80.0),
+      createMockSample(2, 1020, 13.0, 80.0),
+      createMockSample(3, 1030, 13.0, 80.0),
+      createMockSample(4, 1040, 13.0, 80.0),
+      createMockSample(5, 2000, 13.0, 80.0),
+    ];
+    samples[0].gps_alt = -64.0;
+    samples[1].gps_alt = -64.0;
+    samples[2].gps_alt = -64.0;
+    samples[3].gps_alt = -64.0;
+    samples[4].gps_alt = -64.0;
+    samples[5].gps_alt = -34.0; // +30m
+
+    const stats = deriveSessionStats(samples, 1);
+    expect(stats.startAltitudeMeters).toBe(-64.0);
+    expect(stats.maxAltitudeMeters).toBeCloseTo(30.0, 1);
+    expect(stats.seqStep).toBe(1);
+    expect(stats.lossPct).toBe(0.0);
+  });
+});
+
+describe('Live WebSocket Telemetry Stream & Staleness', () => {
+  let repo: SqliteRepository;
+  let sessionManager: SessionManager;
+  let server: http.Server;
+  let wss: WebSocketServer;
+  let wsUrl: string;
+
+  beforeEach(async () => {
+    const files = [TEST_DB, `${TEST_DB}-wal`, `${TEST_DB}-shm`];
+    for (const f of files) {
+      if (fs.existsSync(f)) {
+        try { fs.unlinkSync(f); } catch {}
+      }
+    }
+    repo = new SqliteRepository(TEST_DB);
+    await repo.init();
+    sessionManager = new SessionManager(repo);
+    const app = createExpressApp(repo, sessionManager);
+
+    server = http.createServer(app);
+    wss = new WebSocketServer({ noServer: true });
+
+    server.on('upgrade', (req, socket, head) => {
+      const url = new URL(req.url || '', `http://${req.headers.host}`);
+      if (url.pathname !== '/ws') {
+        socket.destroy();
+        return;
+      }
+
+      const key = url.searchParams.get('key');
+      if (!isViewerAuthorized(key)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        sessionManager.handleConnection(ws, url.searchParams.get('session'));
+      });
+    });
+
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as any;
+        wsUrl = `ws://127.0.0.1:${addr.port}/ws?key=${VIEWER_KEY}&session=latest`;
+        resolve();
+      });
+    });
+  });
+
+  afterEach(async () => {
+    wss.close();
+    sessionManager.dispose();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (repo) await repo.close();
+  });
+
+  it('connects to WebSocket, receives hello message and stream updates for moving GPS fixes', async () => {
+    const session = await repo.createSession('live_test_ses', 'Moving Flight', 'phone_live_1', Date.now(), 'phone');
+    const targetWsUrl = `${wsUrl.split('&session=')[0]}&session=${session.id}`;
+    const client = new WebSocket(targetWsUrl);
+
+    const receivedMessages: WsServerMessage[] = [];
+    client.on('message', (raw) => {
+      try {
+        receivedMessages.push(JSON.parse(raw.toString()));
+      } catch {}
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      client.on('open', resolve);
+      client.on('error', reject);
+    });
+
+    // Ingest moving GPS fixes with seqStep: 5
+    const movingSamples = [
+      {
+        ...createMockSample(0, Date.now() - 50, 13.0827, 80.2707, Date.now() - 50),
+        speed: 4.5,
+        gps_acc: 3.2,
+        gps_provider: 'gps',
+      },
+      {
+        ...createMockSample(5, Date.now(), 13.0835, 80.2715, Date.now()),
+        speed: 5.1,
+        gps_acc: 2.8,
+        gps_provider: 'gps',
+      },
+    ];
+
+    await sessionManager.ingestSamples(session.id, movingSamples, 5);
+
+    // Wait for batch message
+    const batchMsg = await new Promise<WsServerMessage>((resolve, reject) => {
+      const checkExisting = receivedMessages.find((m) => m.type === 'batch');
+      if (checkExisting) return resolve(checkExisting);
+
+      const timer = setTimeout(() => reject(new Error('Timeout waiting for batch')), 4000);
+      const onMsg = (raw: any) => {
+        const msg = JSON.parse(raw.toString()) as WsServerMessage;
+        if (msg.type === 'batch') {
+          clearTimeout(timer);
+          client.off('message', onMsg);
+          resolve(msg);
+        }
+      };
+      client.on('message', onMsg);
+    });
+
+    expect(batchMsg.type).toBe('batch');
+    if (batchMsg.type === 'batch') {
+      expect(batchMsg.samples.length).toBe(2);
+      expect(batchMsg.seqStep).toBe(5);
+      expect(batchMsg.samples[1].lat).toBeCloseTo(13.0835, 4);
+      expect(batchMsg.samples[1].speed).toBeCloseTo(5.1, 1);
+      expect(batchMsg.samples[1].gps_provider).toBe('gps');
+    }
+
+    client.close();
+  });
+
+  it('detects and broadcasts stale GPS fix when last fix is older than 3 seconds', async () => {
+    const session = await repo.createSession('stale_test_ses', 'Stale GPS Flight', 'phone_stale_1', Date.now(), 'phone');
+    const targetWsUrl = `${wsUrl.split('&session=')[0]}&session=${session.id}`;
+    const client = new WebSocket(targetWsUrl);
+
+    await new Promise<void>((resolve, reject) => {
+      client.on('open', resolve);
+      client.on('error', reject);
+    });
+
+    // Send sample where GPS fix was 5 seconds ago
+    const staleFixTime = Date.now() - 5000;
+    const staleSamples = [
+      createMockSample(0, Date.now(), 13.0827, 80.2707, staleFixTime),
+    ];
+
+    await sessionManager.ingestSamples(session.id, staleSamples, 1);
+
+    // Wait for status message
+    const statusMsg = await new Promise<WsServerMessage>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Timeout waiting for status message')), 4000);
+      const handler = (raw: any) => {
+        const msg = JSON.parse(raw.toString()) as WsServerMessage;
+        if (msg.type === 'status' && msg.gps?.ageMs !== undefined && msg.gps?.ageMs !== null) {
+          clearTimeout(timer);
+          client.off('message', handler);
+          resolve(msg);
+        }
+      };
+      client.on('message', handler);
+    });
+
+    expect(statusMsg.type).toBe('status');
+    if (statusMsg.type === 'status') {
+      expect(statusMsg.gps?.ageMs).toBeGreaterThanOrEqual(4000);
+    }
+
+    client.close();
+  });
+
+  it('reports zero rate when data stream stops', async () => {
+    const session = await repo.createSession('stop_test_ses', 'Stopped Stream', 'phone_stop_1', Date.now(), 'phone');
+    const targetWsUrl = `${wsUrl.split('&session=')[0]}&session=${session.id}`;
+    const client = new WebSocket(targetWsUrl);
+
+    await new Promise<void>((resolve, reject) => {
+      client.on('open', resolve);
+      client.on('error', reject);
+    });
+
+    // Feed a sample
+    await sessionManager.ingestSamples(session.id, [createMockSample(0, Date.now())], 1);
+
+    // Wait for status message reporting ratePerSec === 0
+    const statusMsg = await new Promise<WsServerMessage>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Timeout waiting for zero ratePerSec')), 5000);
+      const handler = (raw: any) => {
+        const msg = JSON.parse(raw.toString()) as WsServerMessage;
+        if (msg.type === 'status' && msg.ratePerSec === 0) {
+          clearTimeout(timer);
+          client.off('message', handler);
+          resolve(msg);
+        }
+      };
+      client.on('message', handler);
+    });
+
+    expect(statusMsg.type).toBe('status');
+    if (statusMsg.type === 'status') {
+      expect(statusMsg.ratePerSec).toBe(0);
+    }
+
+    client.close();
   });
 });

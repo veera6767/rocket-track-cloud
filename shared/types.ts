@@ -29,6 +29,8 @@ export interface Sample {
   sats_visible?: number | null;
   gps_cn0?: number | null;
   gps_age_ms?: number | null;
+  gps_msl_alt?: number | null;
+  gps_provider?: 'gps' | 'fused' | 'network' | string | null;
 }
 
 export interface InterpolatedSample extends Sample {
@@ -37,6 +39,7 @@ export interface InterpolatedSample extends Sample {
   accelMag?: number;
   gyroMag?: number;
   magMag?: number;
+  heightAboveStart?: number | null;
 }
 
 export interface Bounds {
@@ -55,11 +58,12 @@ export interface SessionRecord {
   endedAt: number | null;
   sampleCount: number;
   bounds: Bounds | null;
+  seqStep?: number | null;
 }
 
 export type WsServerMessage =
-  | { type: 'hello'; sessionId: string; deviceId?: string; source?: 'phone' | 'sim' | 'fc' }
-  | { type: 'batch'; sessionId: string; samples: Sample[]; isBackfill?: boolean }
+  | { type: 'hello'; sessionId: string; deviceId?: string; source?: 'phone' | 'sim' | 'fc'; seqStep?: number | null }
+  | { type: 'batch'; sessionId: string; samples: Sample[]; isBackfill?: boolean; seqStep?: number | null }
   | {
       type: 'status';
       deviceOnline: boolean;
@@ -67,6 +71,7 @@ export type WsServerMessage =
       ratePerSec: number;
       deviceId?: string;
       source?: 'phone' | 'sim' | 'fc';
+      seqStep?: number | null;
       gps?: {
         lat: number | null;
         lon: number | null;
@@ -74,6 +79,8 @@ export type WsServerMessage =
         ageMs: number | null;
         sats: number | null;
         satsVisible: number | null;
+        acc?: number | null;
+        provider?: string | null;
       };
     }
   | { type: 'session_started'; session: SessionRecord }
@@ -85,7 +92,10 @@ export interface SessionStats {
   maxSpeedKmh: number;
   maxAccelG: number;
   maxAltitudeMeters: number;
+  startAltitudeMeters: number | null;
   sampleCount: number;
   avgRateHz: number;
   packetsLost: number;
+  lossPct: number;
+  seqStep: number;
 }

@@ -61,6 +61,7 @@ export const SensorCharts: React.FC = () => {
     followLive,
     setFollowLive,
     setReplayIndex,
+    startGpsAlt,
   } = useTelemetryStore();
 
   const [activeTab, setActiveTab] = useState<'accel' | 'gyro' | 'mag' | 'gps'>('accel');
@@ -127,7 +128,15 @@ export const SensorCharts: React.FC = () => {
       }
     } else if (activeTab === 'gps') {
       rawArrays.push(filtered.map((s) => s.speed || 0));
-      rawArrays.push(filtered.map((s) => s.gps_alt || 0));
+      rawArrays.push(
+        filtered.map((s) =>
+          s.heightAboveStart !== null && s.heightAboveStart !== undefined
+            ? s.heightAboveStart
+            : s.gps_alt && startGpsAlt
+            ? s.gps_alt - startGpsAlt
+            : 0
+        )
+      );
       rawArrays.push(filtered.map((s) => s.sats || 0));
       rawArrays.push(filtered.map((s) => s.gps_acc || 0));
     }
@@ -257,7 +266,7 @@ export const SensorCharts: React.FC = () => {
     } else {
       return [
         { name: 'Speed (m/s)', color: '#38BDF8', dashed: false },
-        { name: 'Alt (m)', color: '#34D399', dashed: false },
+        { name: 'Height above start (m)', color: '#34D399', dashed: false },
         { name: 'Sats', color: '#FBBF24', dashed: false },
         { name: 'Accuracy (m)', color: '#A78BFA', dashed: false },
       ];

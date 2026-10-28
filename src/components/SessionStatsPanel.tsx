@@ -21,10 +21,11 @@ export const SessionStatsPanel: React.FC = () => {
     loadGhostSession,
     deleteCurrentSession,
     role,
+    seqStep,
   } = useTelemetryStore();
 
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const stats = deriveSessionStats(interpolatedSamples);
+  const stats = deriveSessionStats(interpolatedSamples, seqStep);
 
   const formatDuration = (secs: number) => {
     const h = Math.floor(secs / 3600);
@@ -162,8 +163,13 @@ export const SessionStatsPanel: React.FC = () => {
           <div className="text-[10px] text-[#8A97AD] uppercase">MAX ALTITUDE</div>
           <div className="text-base font-bold text-[#E6EAF2]">
             {stats.maxAltitudeMeters.toFixed(1)}{' '}
-            <span className="text-[10px] font-normal text-[#8A97AD]">m</span>
+            <span className="text-[10px] font-normal text-[#8A97AD]">m (start)</span>
           </div>
+          {stats.startAltitudeMeters !== null && (
+            <div className="text-[9px] text-[#8A97AD] truncate">
+              ref: {stats.startAltitudeMeters.toFixed(1)}m ellipsoid
+            </div>
+          )}
         </div>
 
         <div className="bg-[#0B0F17] p-2.5 rounded-lg border border-[#243049]">
@@ -174,17 +180,22 @@ export const SessionStatsPanel: React.FC = () => {
         </div>
 
         <div className="bg-[#0B0F17] p-2.5 rounded-lg border border-[#243049]">
-          <div className="text-[10px] text-[#8A97AD] uppercase">AVG RATE</div>
-          <div className="text-base font-bold text-[#34D399]">
-            {stats.avgRateHz}{' '}
-            <span className="text-[10px] font-normal text-[#8A97AD]">Hz</span>
+          <div className="text-[10px] text-[#8A97AD] uppercase">RATE / STEP</div>
+          <div className="text-sm font-bold text-[#34D399]">
+            Rate {stats.avgRateHz} Hz
+          </div>
+          <div className="text-[10px] text-[#8A97AD]">
+            (seq step {stats.seqStep})
           </div>
         </div>
 
         <div className="bg-[#0B0F17] p-2.5 rounded-lg border border-[#243049]">
-          <div className="text-[10px] text-[#8A97AD] uppercase">DROPPED PKTS</div>
-          <div className={`text-base font-bold ${stats.packetsLost > 0 ? 'text-[#FBBF24]' : 'text-[#8A97AD]'}`}>
-            {stats.packetsLost}
+          <div className="text-[10px] text-[#8A97AD] uppercase">PACKET LOSS</div>
+          <div className={`text-sm font-bold ${stats.lossPct > 0 ? 'text-[#FBBF24]' : 'text-[#34D399]'}`}>
+            Loss {stats.lossPct.toFixed(1)} %
+          </div>
+          <div className="text-[10px] text-[#8A97AD]">
+            {stats.packetsLost} dropped
           </div>
         </div>
       </div>
