@@ -26,9 +26,24 @@ export class SqliteRepository implements ITelemetryRepository {
 
   constructor(filePath: string = './telemetry.sqlite') {
     this.db = new Database(filePath);
-    // WAL mode for high concurrent throughput
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
+    // In production or container environments like Render, WAL mode relies on memory-mapped
+    // shared memory (-shm) which triggers SIGSEGV (exit code 139) on non-native or restricted filesystems.
+    const isContainer = Boolean(process.env.RENDER || process.env.NODE_ENV === 'production');
+    if (isContainer) {
+      try {
+        this.db.pragma('journal_mode = DELETE');
+        this.db.pragma('synchronous = NORMAL');
+      } catch (err) {
+        console.warn('[DB] Setting journal_mode pragma warning:', err);
+      }
+    } else {
+      try {
+        this.db.pragma('journal_mode = WAL');
+        this.db.pragma('synchronous = NORMAL');
+      } catch {
+        this.db.pragma('journal_mode = DELETE');
+      }
+    }
   }
 
   async close(): Promise<void> {
