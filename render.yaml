@@ -13,13 +13,11 @@ services:
       - key: PORT
         value: 3000
       - key: DEVICE_KEY
-        sync: false
+        value: rocket_device_secret_2026
       - key: VIEWER_KEY
-        sync: false
+        value: ground_station_viewer_2026
       - key: ADMIN_KEY
-        sync: false
-      - key: DATABASE_URL
-        sync: false
+        value: rocket_admin_supersecret_2026
       - key: CORS_ORIGINS
         value: "*"
       - key: RETENTION_DAYS
