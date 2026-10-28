@@ -1,0 +1,9 @@
+node_modules
+dist
+.env*
+*.sqlite*
+test_telemetry.sqlite*
+logs
+.git
+.github
+.gitignore

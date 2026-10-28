@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+coverage/
+logs/
+*.log
+
+# Environment variables
+.env
+.env.local
+.env.production
+!.env.example
+
+# Local SQLite databases & temporary journaling files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+test_telemetry.sqlite*
+
+# OS artifacts
+.DS_Store
+Thumbs.db

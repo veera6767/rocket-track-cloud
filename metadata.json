@@ -1,0 +1,6 @@
+{
+  "name": "Rocket Track Cloud",
+  "description": "Futuristic telemetry ground station and cloud server for sounding rockets and high-rate sensor tracking with 3D trail visualization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
